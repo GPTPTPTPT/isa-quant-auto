@@ -148,4 +148,4 @@ with col_b:
     st.markdown("### 🇰🇷 ISA 매수 추천 티커")
     for tk, weight in w_target.items():
         if weight > 0:
-            st.code(f"{isa_mapping.get(tk, tk)} ({weight * 100:.0f}%)")s
+            st.code(f"{isa_mapping.get(tk, tk)} ({weight * 100:.0f}%)")
