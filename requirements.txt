@@ -1,5 +1,3 @@
-streamlit
+streamstreamlit
 yfinance
 pandas
-pandas-datareader
-numpy

@@ -1,141 +1,151 @@
+import streamlit as st
 import yfinance as yf
-import pandas_datareader.data as web
 import pandas as pd
 import numpy as np
+from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
-def run_v8_clinical_triage_backtest():
-    print("V8 무결점 엔진 구동 중... (Cash Drag 제거, Sortino 지수 적용)")
+# ==========================================
+# 1. 초기 UI 세팅
+# ==========================================
+st.set_page_config(page_title="V8 ISA 오토파일럿", page_icon="🦅", layout="wide")
+st.title("🦅 V8 ISA 자산배분 오토파일럿")
+st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d')} | V8 Clinical Triage Engine")
+
+# ==========================================
+# 2. 데이터 직수입 함수 (에러 라이브러리 제거)
+# ==========================================
+@st.cache_data(ttl=3600)
+def fetch_fred_data():
+    # FRED에서 CSV를 직접 다운로드 (pandas_datareader 미사용)
+    def get_series(series_id):
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        df = pd.read_csv(url, index_col='DATE', parse_dates=True, na_values='.')
+        df.columns = [series_id]
+        return df
     
-    start_date, end_date = "2007-01-01", "2026-05-30"
+    hy = get_series('BAMLH0A0HYM2')
+    unrate = get_series('UNRATE')
+    fred_df = hy.join(unrate, how='outer').ffill().last('400D')
+    return fred_df
+
+@st.cache_data(ttl=3600)
+def fetch_price_data():
     tickers = ['SPY', 'QQQ', 'SOXX', 'GLD', 'TLT', 'IEF', 'SHY', 'DBC']
-    
-    price_df = yf.download(tickers, start=start_date, end=end_date, progress=False)['Close']
-    price_df.dropna(inplace=True) 
-    
-    fred_df = web.DataReader(['BAMLH0A0HYM2', 'UNRATE'], 'fred', start_date, end_date)
-    unrate_monthly = fred_df['UNRATE'].resample('MS').first()
-    sahm_monthly = unrate_monthly.rolling(3).mean() - unrate_monthly.rolling(12).min()
-    fred_df['SAHM'] = sahm_monthly.reindex(fred_df.index).ffill() 
-    fred_df.ffill(inplace=True)
-    
-    df = price_df.join(fred_df, how='inner').ffill()
-    df['DBC_Z'] = (df['DBC'] - df['DBC'].rolling(200).mean()) / df['DBC'].rolling(200).std()
-    
-    trading_fee = 0.0015 
-    monthly_dates = df.resample('BM').last().index
-    
-    cash = 1000000 
-    monthly_injection = 2000000
-    shares = {tk: 0 for tk in tickers}
-    
-    val_history, turnover_history = [], []
-    target_weights = None 
-    pending_rebalance = False 
-    
-    def get_mom(data, date_idx, tk):
-        try:
-            loc = data.index.get_loc(date_idx)
-            if loc < 252: return 0
-            m1 = (data[tk].iloc[loc] / data[tk].iloc[loc-21]) - 1
-            m3 = (data[tk].iloc[loc] / data[tk].iloc[loc-63]) - 1
-            m6 = (data[tk].iloc[loc] / data[tk].iloc[loc-126]) - 1
-            m12 = (data[tk].iloc[loc] / data[tk].iloc[loc-252]) - 1
-            return (m1 * 0.2) + (m3 * 0.3) + (m6 * 0.3) + (m12 * 0.2)
-        except: return 0
+    start_date = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
+    df = yf.download(tickers, start=start_date, progress=False)['Close']
+    df.dropna(inplace=True)
+    return df
 
-    for i in range(len(df)):
-        date = df.index[i]
-        row = df.iloc[i]
-        
-        # [수정 1] T+1일 시작 시점에 적립금 즉시 투입 (Cash Drag 제거)
-        is_first_day_of_month = (date.month != df.index[i-1].month if i > 0 else False)
-        if is_first_day_of_month:
-            cash += monthly_injection
-            
-        current_port_value = cash + sum(shares[k] * row[k] for k in shares)
-        
-        # [수정 2] T+1일 체결 (투입된 적립금을 포함하여 Diff 계산 및 매매)
-        if pending_rebalance and target_weights is not None:
-            trade_volume = 0
-            
-            # 매도 먼저 집행
-            for k in shares:
-                target_val = current_port_value * target_weights.get(k, 0)
-                current_val = shares[k] * row[k]
-                if target_val < current_val:
-                    trade_amt = current_val - target_val
-                    fee = trade_amt * trading_fee
-                    shares[k] -= (trade_amt / row[k])
-                    cash += (trade_amt - fee)
-                    trade_volume += trade_amt
-                    
-            # 매수 집행
-            for k in shares:
-                target_val = current_port_value * target_weights.get(k, 0)
-                current_val = shares[k] * row[k]
-                if target_val > current_val:
-                    trade_amt = min(target_val - current_val, cash)
-                    fee = trade_amt * trading_fee
-                    shares[k] += ((trade_amt - fee) / row[k])
-                    cash -= trade_amt
-                    trade_volume += trade_amt
-            
-            turnover_history.append(trade_volume / current_port_value)
-            pending_rebalance = False
-            
-        # [T일 종가] 트리아지(Triage) 기반 체제 판별 및 시그널 생성
-        if date in monthly_dates and i >= 252:
-            off_mom = {tk: get_mom(df, date, tk) for tk in ['QQQ', 'SOXX', 'SPY']}
-            def_mom = {tk: get_mom(df, date, tk) for tk in ['GLD', 'TLT', 'IEF', 'SHY']}
-            top_off = max(off_mom, key=off_mom.get)
-            w_target = {tk: 0.0 for tk in shares}
-            
-            is_crisis = row['BAMLH0A0HYM2'] >= 5.0 or row['SAHM'] >= 0.5
-            is_inflation = row['DBC_Z'] > 1.5
-            is_deflation = row['DBC_Z'] < -1.0
-            
-            # 엄격한 계층 구조 (확률 배분 배제)
-            if is_crisis:
-                w_target['SHY'], w_target['GLD'] = 0.7, 0.3
-            elif is_inflation:
-                w_target['GLD'], w_target['SHY'], w_target['SPY'] = 0.4, 0.2, 0.4
-            elif is_deflation:
-                w_target['TLT'] = 0.5 if def_mom['TLT'] > 0 else 0.0
-                w_target['IEF'] = 0.5 if def_mom['TLT'] <= 0 else 0.0
-                w_target['QQQ'] = 0.5
-            else: 
-                if off_mom[top_off] > 0:
-                    w_target[top_off], w_target['SPY'] = 0.8, 0.2
-                else:
-                    w_target['SHY'] = 1.0
-            
-            target_weights = w_target
-            pending_rebalance = True 
-            
-        val_history.append(cash + sum(shares[k] * row[k] for k in shares))
+with st.spinner("미 연준(FRED) 및 글로벌 금융 데이터 직수입 중..."):
+    try:
+        fred_df = fetch_fred_data()
+        price_df = fetch_price_data()
+    except Exception as e:
+        st.error(f"데이터 통신 에러: {e}")
+        st.stop()
 
-    df['Portfolio_Value'] = val_history
-    
-    # [수정 3] 정밀 지표 산출 (Exact CAGR & Sortino)
-    total_days = (df.index[-1] - df.index[0]).days
-    cagr = (df['Portfolio_Value'].iloc[-1] / df['Portfolio_Value'].iloc[0]) ** (365.25 / total_days) - 1
-    
-    daily_returns = df['Portfolio_Value'].pct_change().dropna()
-    downside_returns = daily_returns[daily_returns < 0]
-    sortino_ratio = np.sqrt(252) * (daily_returns.mean() / downside_returns.std())
-    
-    mdd = ((df['Portfolio_Value'] - df['Portfolio_Value'].cummax()) / df['Portfolio_Value'].cummax()).min()
-    avg_annual_turnover = np.mean(turnover_history) * 12 if turnover_history else 0
+# ==========================================
+# 3. 거시 지표 및 모멘텀 연산 (V8 로직)
+# ==========================================
+# [거시] 하이일드 스프레드 & 샴 룰
+hy_spread = fred_df['BAMLH0A0HYM2'].dropna().iloc[-1]
+unrate_monthly = fred_df['UNRATE'].dropna().resample('MS').first()
+sahm_rule = (unrate_monthly.rolling(3).mean() - unrate_monthly.rolling(12).min()).iloc[-1]
 
-    print(f"==================================================================")
-    print(f" [V8 Clinical Triage Engine 결괏값]")
-    print(f"==================================================================")
-    print(f" 정확한 연평균 수익률(CAGR) : {cagr*100:.2f}%")
-    print(f" 소르티노 지수(Sortino)     : {sortino_ratio:.2f} (하방 리스크 통제력)")
-    print(f" 최대 낙폭(MDD)             : {mdd*100:.2f}%")
-    print(f" 연평균 회전율(Turnover)    : {avg_annual_turnover*100:.1f}%")
-    print(f"==================================================================")
+# [원자재] DBC Z-Score
+dbc_prices = price_df['DBC']
+dbc_ma200 = dbc_prices.rolling(200).mean().iloc[-1]
+dbc_std200 = dbc_prices.rolling(200).std().iloc[-1]
+dbc_z = (dbc_prices.iloc[-1] - dbc_ma200) / dbc_std200 if dbc_std200 > 0 else 0
 
-run_v8_clinical_triage_backtest()
+# [모멘텀] 다중 기간 가중 점수 (1M, 3M, 6M, 12M)
+def calc_momentum(df, tk):
+    if len(df) < 252: return 0
+    p = df[tk]
+    m1 = (p.iloc[-1] / p.iloc[-21]) - 1
+    m3 = (p.iloc[-1] / p.iloc[-63]) - 1
+    m6 = (p.iloc[-1] / p.iloc[-126]) - 1
+    m12 = (p.iloc[-1] / p.iloc[-252]) - 1
+    return (m1 * 0.2) + (m3 * 0.3) + (m6 * 0.3) + (m12 * 0.2)
+
+off_mom = {tk: calc_momentum(price_df, tk) for tk in ['QQQ', 'SOXX', 'SPY']}
+def_mom = {tk: calc_momentum(price_df, tk) for tk in ['GLD', 'TLT', 'IEF', 'SHY']}
+top_off = max(off_mom, key=off_mom.get)
+
+# ==========================================
+# 4. 트리아지(Triage) 체제 판별 및 비중 할당
+# ==========================================
+w_target = {tk: 0.0 for tk in ['QQQ', 'SOXX', 'SPY', 'GLD', 'TLT', 'IEF', 'SHY']}
+
+is_crisis = hy_spread >= 5.0 or sahm_rule >= 0.5
+is_inflation = dbc_z > 1.5
+is_deflation = dbc_z < -1.0
+
+regime_text = ""
+regime_color = ""
+
+if is_crisis:
+    regime_text = "🚨 [CRISIS] 시스템 붕괴 감지. 현금/금 전량 대피"
+    regime_color = "error"
+    w_target['SHY'], w_target['GLD'] = 0.7, 0.3
+elif is_inflation:
+    regime_text = "🔥 [INFLATION] 원자재 발작. 방어적 혼합 자산 배분"
+    regime_color = "warning"
+    w_target['GLD'], w_target['SHY'], w_target['SPY'] = 0.4, 0.2, 0.4
+elif is_deflation:
+    regime_text = "❄️ [DEFLATION] 침체 국면. 국채 및 유동성 자산(QQQ) 헷지"
+    regime_color = "info"
+    w_target['TLT'] = 0.5 if def_mom['TLT'] > 0 else 0.0
+    w_target['IEF'] = 0.5 if def_mom['TLT'] <= 0 else 0.0
+    w_target['QQQ'] = 0.5
+else:
+    regime_text = "☀️ [GOLDILOCKS] 안정적 성장. 상위 공격 자산 몰빵"
+    regime_color = "success"
+    if off_mom[top_off] > 0:
+        w_target[top_off], w_target['SPY'] = 0.8, 0.2
+    else:
+        w_target['SHY'] = 1.0 # 상승장이지만 가격이 부러진 기현상 방어
+
+# ==========================================
+# 5. 화면 출력 (대시보드 UI)
+# ==========================================
+st.subheader("1️⃣ 실시간 매크로 센서 (FRED & Market)")
+c1, c2, c3 = st.columns(3)
+c1.metric("HY 스프레드", f"{hy_spread:.2f}%", "5.0% 이상 위기", delta_color="inverse")
+c2.metric("샴 룰 (Sahm)", f"{sahm_rule:.2f}%p", "0.5%p 이상 침체", delta_color="inverse")
+c3.metric("원자재(DBC) Z-스코어", f"{dbc_z:.2f}", "1.5 이상 인플레", delta_color="inverse")
+
+st.divider()
+
+st.subheader("2️⃣ 이번 달 ISA 계좌 매매 지침")
+if regime_color == "error": st.error(f"**{regime_text}**")
+elif regime_color == "warning": st.warning(f"**{regime_text}**")
+elif regime_color == "success": st.success(f"**{regime_text}**")
+else: st.info(f"**{regime_text}**")
+
+isa_mapping = {
+    'QQQ': 'ACE 미국빅테크TOP7Plus',
+    'SOXX': 'TIGER 미국필라델피아반도체나스닥',
+    'SPY': 'TIGER 미국S&P500',
+    'GLD': 'ACE KRX금현물',
+    'TLT': 'ACE 미국30년국채액티브(H)',
+    'IEF': 'TIGER 미국10년국채',
+    'SHY': 'KODEX 미국달러SOFR금리액티브'
+}
+
+st.write("매월 10일경, HTS/MTS를 켜고 기존 자산을 아래 비중에 맞게 리밸런싱 하십시오.")
+
+col_a, col_b = st.columns([1, 1])
+with col_a:
+    st.markdown("### 🛒 목표 비중 (%)")
+    for tk, weight in w_target.items():
+        if weight > 0:
+            st.write(f"• **{tk}**: {weight * 100:.0f}%")
+            st.progress(int(weight * 100))
+with col_b:
+    st.markdown("### 🇰🇷 ISA 매수 추천 티커")
+    for tk, weight in w_target.items():
+        if weight > 0:
+            st.code(f"{isa_mapping.get(tk, tk)} ({weight * 100:.0f}%)")s
