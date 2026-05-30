@@ -14,7 +14,7 @@ st.title("🦅 V8 ISA 자산배분 오토파일럿")
 st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d')} | V8 Clinical Triage Engine")
 
 # ==========================================
-# 2. 데이터 직수입 함수 (데이터 증발 원천 차단)
+# 2. 데이터 직수입 함수 (안정성 극대화)
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_fred_data():
@@ -33,54 +33,73 @@ def fetch_fred_data():
 @st.cache_data(ttl=3600)
 def fetch_price_data():
     tickers = ['SPY', 'QQQ', 'SOXX', 'GLD', 'TLT', 'IEF', 'SHY', 'DBC']
-    # 200일 이평선 및 252일 모멘텀 계산을 위해 넉넉하게 600일치 확보
-    start_date = (datetime.now() - timedelta(days=600)).strftime('%Y-%m-%d') 
-    df = yf.download(tickers, start=start_date, progress=False)
+    start_date = (datetime.now() - timedelta(days=600)).strftime('%Y-%m-%d')
     
-    # yfinance 버전 차이에 따른 열(Column) 구조 방어 로직
-    if isinstance(df.columns, pd.MultiIndex):
-        if 'Close' in df.columns.levels[0]:
-            df = df['Close']
-            
-    # [핵심 수정] 무식한 dropna() 제거 -> 전날 종가로 빈칸 채우기(ffill)
-    df = df.ffill().bfill()
+    # [백업 전략] 야후 파이낸스 패키지 불안정 대응용 다중 시도 로직
+    try:
+        df = yf.download(tickers, start=start_date, progress=False)
+        
+        # MultiIndex 열 구조 해제
+        if isinstance(df.columns, pd.MultiIndex):
+            if 'Close' in df.columns.levels[0]:
+                df = df['Close']
+            elif 'Adj Close' in df.columns.levels[0]:
+                df = df['Adj Close']
+    except:
+        # 야후 파이낸스 전면 다운 시 Stooq 글로벌 백업 데이터셋 즉시 호출
+        dfs = []
+        for t in tickers:
+            url = f"https://stooq.com/q/d/l/?s={t}.us&i=d"
+            tmp = pd.read_csv(url, index_col='Date', parse_dates=True)[['Close']]
+            tmp.columns = [t]
+            dfs.append(tmp)
+        df = pd.concat(dfs, axis=1).sort_index()
+
+    # 데이터 최종 정제 및 주말/공휴일 공백 밀어내기 메우기
+    df = df.last('500D').ffill().bfill()
     return df
 
-with st.spinner("미 연준(FRED) 및 글로벌 금융 데이터 긁어오는 중..."):
+with st.spinner("글로벌 매크로 센서 및 자산 가격 데이터 실시간 스캔 중..."):
     try:
         fred_df = fetch_fred_data()
         price_df = fetch_price_data()
     except Exception as e:
-        st.error(f"데이터 통신 에러: {e}")
+        st.error(f"데이터 통신 에코 에러: {e}")
         st.stop()
 
-# 2중 안전장치: 데이터가 비어있거나 너무 짧으면 중단
-if price_df.empty or len(price_df) < 252:
-    st.error("야후 파이낸스 데이터 로딩 실패. 1~2분 뒤 새로고침 해주세요.")
+# ==========================================
+# 3. 데이터 안정성 검증 규격화
+# ==========================================
+if price_df.empty or len(price_df) < 100:
+    st.error("⚠️ 글로벌 데이터 서버 일시적 지연 상태입니다. 30초 후 웹브라우저를 새로고침(F5) 해주세요.")
     st.stop()
 
+# 데이터 개수가 가파른 연산에 부족할 경우 윈도우 크기 동적 조절
+available_len = len(price_df)
+m1_win = min(21, available_len - 1)
+m3_win = min(63, available_len - 1)
+m6_win = min(126, available_len - 1)
+m12_win = min(252, available_len - 1)
+
 # ==========================================
-# 3. 거시 지표 및 모멘텀 연산 (V8 로직)
+# 4. 거시 지표 및 모멘텀 연산 (V8 로직)
 # ==========================================
 try:
-    # [거시] 하이일드 스프레드 & 샴 룰
     hy_spread = fred_df['BAMLH0A0HYM2'].dropna().iloc[-1]
     unrate_monthly = fred_df['UNRATE'].dropna().resample('MS').first()
     sahm_rule = (unrate_monthly.rolling(3).mean() - unrate_monthly.rolling(12).min()).iloc[-1]
 
-    # [원자재] DBC Z-Score
     dbc_prices = price_df['DBC']
-    dbc_ma200 = dbc_prices.rolling(200).mean().iloc[-1]
-    dbc_std200 = dbc_prices.rolling(200).std().iloc[-1]
+    dbc_ma200 = dbc_prices.rolling(min(200, len(dbc_prices))).mean().iloc[-1]
+    dbc_std200 = dbc_prices.rolling(min(200, len(dbc_prices))).std().iloc[-1]
     dbc_z = (dbc_prices.iloc[-1] - dbc_ma200) / dbc_std200 if dbc_std200 > 0 else 0
 
-    # [모멘텀] 다중 기간 가중 점수 (1M, 3M, 6M, 12M)
     def calc_momentum(df, tk):
         p = df[tk]
-        m1 = (p.iloc[-1] / p.iloc[-21]) - 1
-        m3 = (p.iloc[-1] / p.iloc[-63]) - 1
-        m6 = (p.iloc[-1] / p.iloc[-126]) - 1
-        m12 = (p.iloc[-1] / p.iloc[-252]) - 1
+        m1 = (p.iloc[-1] / p.iloc[-m1_win]) - 1
+        m3 = (p.iloc[-1] / p.iloc[-m3_win]) - 1
+        m6 = (p.iloc[-1] / p.iloc[-m6_win]) - 1
+        m12 = (p.iloc[-1] / p.iloc[-m12_win]) - 1
         return (m1 * 0.2) + (m3 * 0.3) + (m6 * 0.3) + (m12 * 0.2)
 
     off_mom = {tk: calc_momentum(price_df, tk) for tk in ['QQQ', 'SOXX', 'SPY']}
@@ -88,11 +107,11 @@ try:
     top_off = max(off_mom, key=off_mom.get)
     
 except Exception as e:
-    st.error(f"지표 연산 중 에러 발생 (데이터 꼬임): {e}")
+    st.error(f"데이터 정밀 파싱 실패: {e}")
     st.stop()
 
 # ==========================================
-# 4. 트리아지(Triage) 체제 판별 및 비중 할당
+# 5. 트리아지(Triage) 체제 판별 및 비중 할당
 # ==========================================
 w_target = {tk: 0.0 for tk in ['QQQ', 'SOXX', 'SPY', 'GLD', 'TLT', 'IEF', 'SHY']}
 
@@ -126,7 +145,7 @@ else:
         w_target['SHY'] = 1.0 
 
 # ==========================================
-# 5. 화면 출력 (대시보드 UI)
+# 6. 화면 출력 (대시보드 UI)
 # ==========================================
 st.subheader("1️⃣ 실시간 매크로 센서 (FRED & Market)")
 c1, c2, c3 = st.columns(3)
