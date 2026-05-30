@@ -2,6 +2,8 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import requests
+import io
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
@@ -11,68 +13,75 @@ warnings.filterwarnings('ignore')
 # ==========================================
 st.set_page_config(page_title="V8 ISA 오토파일럿", page_icon="🦅", layout="wide")
 st.title("🦅 V8 ISA 자산배분 오토파일럿")
-st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d')} | 무결점 서버 방어 엔진")
+st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d')} | IP 차단 우회 데이터 통신망 적용")
 
 # ==========================================
-# 2. 데이터 수집 (IP 차단 방어 좀비 로직)
+# 2. 데이터 수집 (Stooq 메인 + 웹브라우저 위장)
 # ==========================================
 @st.cache_data(ttl=1800)
 def get_market_data():
     tickers = ['SPY', 'QQQ', 'SOXX', 'GLD', 'TLT', 'IEF', 'SHY', 'DBC']
     is_offline = False
     
-    # 1) FRED 거시 데이터 호출
+    # 일반 크롬 브라우저인 것처럼 위장하여 서버 차단 회피
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'}
+    
+    # 1) FRED 거시 데이터 호출 (위장망)
     try:
         def get_fred(id):
             url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
-            return pd.read_csv(url, index_col=0, parse_dates=True)[id]
+            res = requests.get(url, headers=headers)
+            return pd.read_csv(io.StringIO(res.text), index_col=0, parse_dates=True)[id]
         fred_df = pd.concat([get_fred('BAMLH0A0HYM2'), get_fred('UNRATE')], axis=1).ffill().last('400D')
     except:
-        # FRED 차단 시 가짜 데이터로 앱 생존 유지
         dates = pd.date_range(end=datetime.now(), periods=300, freq='B')
         fred_df = pd.DataFrame({'BAMLH0A0HYM2': [3.5]*300, 'UNRATE': [4.0]*300}, index=dates)
         is_offline = True
 
-    # 2) 야후 파이낸스 가격 데이터 호출
+    # 2) 가격 데이터 (1순위: Stooq 글로벌 데이터 / 2순위: 야후 파이낸스)
     try:
-        # 시도 1: 한 번에 다운로드
-        df = yf.download(tickers, period="2y", progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df = df['Close'] if 'Close' in df.columns.levels[0] else df['Adj Close']
-        price_df = df.ffill().bfill()
-        if price_df.empty or len(price_df) < 100: raise Exception("Empty")
+        # [1순위] Stooq API 우회 수집
+        dfs = []
+        for t in tickers:
+            url = f"https://stooq.com/q/d/l/?s={t.lower()}.us&i=d"
+            res = requests.get(url, headers=headers)
+            tmp = pd.read_csv(io.StringIO(res.text), index_col='Date', parse_dates=True)
+            tmp = tmp[['Close']].rename(columns={'Close': t})
+            dfs.append(tmp)
+        price_df = pd.concat(dfs, axis=1).sort_index().last('500D').ffill().bfill()
+        if price_df.empty or len(price_df) < 100: raise Exception("Stooq 1차 우회 실패")
     except:
         try:
-            # 시도 2: IP 차단 우회를 위한 개별 티커 호출
-            dfs = [yf.Ticker(t).history(period="2y")[['Close']].rename(columns={'Close':t}) for t in tickers]
-            price_df = pd.concat(dfs, axis=1).ffill().bfill()
-            if price_df.empty or len(price_df) < 100: raise Exception("Empty")
+            # [2순위] 야후 파이낸스 (Stooq 실패 시에만 구동)
+            df = yf.download(tickers, period="2y", progress=False)
+            if isinstance(df.columns, pd.MultiIndex):
+                df = df['Close'] if 'Close' in df.columns.levels[0] else df['Adj Close']
+            price_df = df.ffill().bfill()
+            if price_df.empty or len(price_df) < 100: raise Exception("Yahoo 2차 우회 실패")
         except:
-            # 시도 3: 완전히 차단당했을 때 (좀비 모드)
+            # [최후방어선] 좀비 모드
             dates = pd.date_range(end=datetime.now(), periods=300, freq='B')
             price_df = pd.DataFrame(100.0, index=dates, columns=tickers)
             is_offline = True
             
     return fred_df, price_df, is_offline
 
-with st.spinner("글로벌 데이터 서버 접속 중..."):
+with st.spinner("글로벌 암호화 통신망(Stooq & FRED) 스캔 중..."):
     fred_df, price_df, is_offline = get_market_data()
 
 # 오프라인 모드일 경우 원장님께 상황 알림
 if is_offline:
-    st.error("🚨 **현재 스트림릿 무료 서버 IP가 야후 파이낸스로부터 일시적 접속 차단을 당했습니다.** \n\n앱이 멈추는 것을 방지하기 위해 임시 가상 데이터를 표출 중입니다. 차단이 풀리면(보통 1~2시간 뒤) 정상적인 데이터로 리밸런싱 지침이 표시됩니다.")
+    st.error("🚨 **현재 스트림릿 무료 서버 IP가 글로벌 데이터 제공사들로부터 일시적 접속 차단을 당했습니다.** \n\n앱 붕괴를 방지하기 위해 가상 데이터를 표출 중입니다. 차단이 풀리면(보통 1시간 내외) 정상적인 리밸런싱 지침이 표시됩니다.")
 
 # ==========================================
 # 3. 거시 지표 및 모멘텀 연산
 # ==========================================
-# 데이터 길이에 맞춘 유연한 윈도우
 available_len = len(price_df)
 m1_win = min(21, available_len - 1)
 m3_win = min(63, available_len - 1)
 m6_win = min(126, available_len - 1)
 m12_win = min(252, available_len - 1)
 
-# 지표 연산
 hy_spread = fred_df['BAMLH0A0HYM2'].iloc[-1]
 sahm_rule = 0.2
 if len(fred_df['UNRATE'].dropna()) >= 12:
