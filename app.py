@@ -11,126 +11,99 @@ warnings.filterwarnings('ignore')
 # ==========================================
 st.set_page_config(page_title="V8 ISA 오토파일럿", page_icon="🦅", layout="wide")
 st.title("🦅 V8 ISA 자산배분 오토파일럿")
-st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d')} | V8 Clinical Triage Engine")
+st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d')} | 무결점 서버 방어 엔진")
 
 # ==========================================
-# 2. 데이터 직수입 함수 (안정성 극대화 버전)
+# 2. 데이터 수집 (IP 차단 방어 좀비 로직)
 # ==========================================
-@st.cache_data(ttl=3600)
-def fetch_fred_data():
-    def get_series(series_id):
-        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        df = pd.read_csv(url, index_col=0, parse_dates=True, na_values='.')
-        df.columns = [series_id]
-        df.index.name = 'DATE'
-        return df
-    try:
-        hy = get_series('BAMLH0A0HYM2')
-        unrate = get_series('UNRATE')
-        fred_df = hy.join(unrate, how='outer').ffill().last('400D')
-    except:
-        st.warning("⚠️ FRED 서버 지연으로 임시 매크로 지표를 대입합니다.")
-        data = {'BAMLH0A0HYM2': [3.5], 'UNRATE': [4.0]}
-        fred_df = pd.DataFrame(data, index=[datetime.now()])
-    return fred_df
-
-@st.cache_data(ttl=3600)
-def fetch_price_data():
+@st.cache_data(ttl=1800)
+def get_market_data():
     tickers = ['SPY', 'QQQ', 'SOXX', 'GLD', 'TLT', 'IEF', 'SHY', 'DBC']
-    start_date = (datetime.now() - timedelta(days=600)).strftime('%Y-%m-%d')
+    is_offline = False
     
+    # 1) FRED 거시 데이터 호출
     try:
-        df = yf.download(tickers, start=start_date, progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            if 'Close' in df.columns.levels[0]: df = df['Close']
-            elif 'Adj Close' in df.columns.levels[0]: df = df['Adj Close']
+        def get_fred(id):
+            url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={id}"
+            return pd.read_csv(url, index_col=0, parse_dates=True)[id]
+        fred_df = pd.concat([get_fred('BAMLH0A0HYM2'), get_fred('UNRATE')], axis=1).ffill().last('400D')
     except:
-        dfs = []
-        for t in tickers:
-            try:
-                url = f"https://stooq.com/q/d/l/?s={t}.us&i=d"
-                tmp = pd.read_csv(url, index_col='Date', parse_dates=True)[['Close']]
-                tmp.columns = [t]
-                dfs.append(tmp)
-            except:
-                pass
-        if dfs:
-            df = pd.concat(dfs, axis=1).sort_index()
-        else:
-            df = pd.DataFrame()
+        # FRED 차단 시 가짜 데이터로 앱 생존 유지
+        dates = pd.date_range(end=datetime.now(), periods=300, freq='B')
+        fred_df = pd.DataFrame({'BAMLH0A0HYM2': [3.5]*300, 'UNRATE': [4.0]*300}, index=dates)
+        is_offline = True
 
-    if not df.empty:
-        df = df.ffill().bfill()
-    return df
+    # 2) 야후 파이낸스 가격 데이터 호출
+    try:
+        # 시도 1: 한 번에 다운로드
+        df = yf.download(tickers, period="2y", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df = df['Close'] if 'Close' in df.columns.levels[0] else df['Adj Close']
+        price_df = df.ffill().bfill()
+        if price_df.empty or len(price_df) < 100: raise Exception("Empty")
+    except:
+        try:
+            # 시도 2: IP 차단 우회를 위한 개별 티커 호출
+            dfs = [yf.Ticker(t).history(period="2y")[['Close']].rename(columns={'Close':t}) for t in tickers]
+            price_df = pd.concat(dfs, axis=1).ffill().bfill()
+            if price_df.empty or len(price_df) < 100: raise Exception("Empty")
+        except:
+            # 시도 3: 완전히 차단당했을 때 (좀비 모드)
+            dates = pd.date_range(end=datetime.now(), periods=300, freq='B')
+            price_df = pd.DataFrame(100.0, index=dates, columns=tickers)
+            is_offline = True
+            
+    return fred_df, price_df, is_offline
 
-with st.spinner("글로벌 매크로 센서 및 자산 가격 데이터 실시간 스캔 중..."):
-    fred_df = fetch_fred_data()
-    price_df = fetch_price_data()
+with st.spinner("글로벌 데이터 서버 접속 중..."):
+    fred_df, price_df, is_offline = get_market_data()
+
+# 오프라인 모드일 경우 원장님께 상황 알림
+if is_offline:
+    st.error("🚨 **현재 스트림릿 무료 서버 IP가 야후 파이낸스로부터 일시적 접속 차단을 당했습니다.** \n\n앱이 멈추는 것을 방지하기 위해 임시 가상 데이터를 표출 중입니다. 차단이 풀리면(보통 1~2시간 뒤) 정상적인 데이터로 리밸런싱 지침이 표시됩니다.")
 
 # ==========================================
-# 3. 데이터 최종 유효성 검증 및 예외 처리
+# 3. 거시 지표 및 모멘텀 연산
 # ==========================================
-if price_df.empty:
-    st.error("⚠️ 글로벌 금융 데이터 서버(Yahoo/Stooq)가 모두 응답하지 않고 있습니다. 잠시 후 새로고침 해주세요.")
-    st.stop()
-
-# 확보된 데이터 길이에 맞춰 계산 범위 유연하게 가변화
+# 데이터 길이에 맞춘 유연한 윈도우
 available_len = len(price_df)
 m1_win = min(21, available_len - 1)
 m3_win = min(63, available_len - 1)
 m6_win = min(126, available_len - 1)
 m12_win = min(252, available_len - 1)
 
-# ==========================================
-# 4. 거시 지표 및 모멘텀 연산 (V8 로직)
-# ==========================================
-try:
-    hy_spread = fred_df['BAMLH0A0HYM2'].ffill().iloc[-1] if 'BAMLH0A0HYM2' in fred_df.columns else 3.5
-    
-    if 'UNRATE' in fred_df.columns and len(fred_df['UNRATE'].dropna()) >= 12:
-        unrate_monthly = fred_df['UNRATE'].dropna().resample('MS').first()
-        sahm_rule = (unrate_monthly.rolling(3).mean() - unrate_monthly.rolling(12).min()).iloc[-1]
-    else:
-        sahm_rule = 0.2
+# 지표 연산
+hy_spread = fred_df['BAMLH0A0HYM2'].iloc[-1]
+sahm_rule = 0.2
+if len(fred_df['UNRATE'].dropna()) >= 12:
+    unrate_monthly = fred_df['UNRATE'].dropna().resample('MS').first()
+    sahm_rule = (unrate_monthly.rolling(3).mean() - unrate_monthly.rolling(12).min()).iloc[-1]
 
-    dbc_prices = price_df['DBC'] if 'DBC' in price_df.columns else price_df['SPY'] 
-    dbc_win = min(200, len(dbc_prices))
-    dbc_ma200 = dbc_prices.rolling(dbc_win).mean().iloc[-1]
-    dbc_std200 = dbc_prices.rolling(dbc_win).std().iloc[-1]
-    dbc_z = (dbc_prices.iloc[-1] - dbc_ma200) / dbc_std200 if dbc_std200 > 0 else 0
+dbc_win = min(200, len(price_df['DBC']))
+dbc_ma200 = price_df['DBC'].rolling(dbc_win).mean().iloc[-1]
+dbc_std200 = price_df['DBC'].rolling(dbc_win).std().iloc[-1]
+dbc_z = (price_df['DBC'].iloc[-1] - dbc_ma200) / dbc_std200 if dbc_std200 > 0 else 0
 
-    def calc_momentum(df, tk):
-        # [오타 수정 완료] tk syntax not in 삭제 
-        if tk not in df.columns: return -999
-        p = df[tk]
-        m1 = (p.iloc[-1] / p.iloc[-m1_win]) - 1 if m1_win > 0 else 0
-        m3 = (p.iloc[-1] / p.iloc[-m3_win]) - 1 if m3_win > 0 else 0
-        m6 = (p.iloc[-1] / p.iloc[-m6_win]) - 1 if m6_win > 0 else 0
-        m12 = (p.iloc[-1] / p.iloc[-m12_win]) - 1 if m12_win > 0 else 0
-        return (m1 * 0.2) + (m3 * 0.3) + (m6 * 0.3) + (m12 * 0.2)
+def calc_momentum(df, tk):
+    p = df[tk]
+    m1 = (p.iloc[-1] / p.iloc[-m1_win]) - 1 if m1_win > 0 else 0
+    m3 = (p.iloc[-1] / p.iloc[-m3_win]) - 1 if m3_win > 0 else 0
+    m6 = (p.iloc[-1] / p.iloc[-m6_win]) - 1 if m6_win > 0 else 0
+    m12 = (p.iloc[-1] / p.iloc[-m12_win]) - 1 if m12_win > 0 else 0
+    return (m1 * 0.2) + (m3 * 0.3) + (m6 * 0.3) + (m12 * 0.2)
 
-    active_tickers = [t for t in ['QQQ', 'SOXX', 'SPY'] if t in price_df.columns]
-    off_mom = {tk: calc_momentum(price_df, tk) for tk in active_tickers}
-    def_mom = {tk: calc_momentum(price_df, tk) for tk in ['GLD', 'TLT', 'IEF', 'SHY'] if tk in price_df.columns}
-    
-    top_off = max(off_mom, key=off_mom.get) if off_mom else 'SPY'
-    
-except Exception as e:
-    st.error(f"시스템 지표 파싱 오류 (자동 우회 실행): {e}")
-    top_off = 'SPY'
-    hy_spread, sahm_rule, dbc_z = 3.5, 0.2, 0.0
+off_mom = {tk: calc_momentum(price_df, tk) for tk in ['QQQ', 'SOXX', 'SPY']}
+def_mom = {tk: calc_momentum(price_df, tk) for tk in ['GLD', 'TLT', 'IEF', 'SHY']}
+top_off = max(off_mom, key=off_mom.get) if off_mom else 'SPY'
 
 # ==========================================
-# 5. 트리아지(Triage) 체제 판별 및 비중 할당
+# 4. 트리아지(Triage) 체제 판별 및 비중 할당
 # ==========================================
 w_target = {tk: 0.0 for tk in ['QQQ', 'SOXX', 'SPY', 'GLD', 'TLT', 'IEF', 'SHY']}
 
 is_crisis = hy_spread >= 5.0 or sahm_rule >= 0.5
 is_inflation = dbc_z > 1.5
 is_deflation = dbc_z < -1.0
-
-regime_text = ""
-regime_color = ""
 
 if is_crisis:
     regime_text = "🚨 [CRISIS] 시스템 붕괴 감지. 현금/금 전량 대피"
@@ -143,19 +116,19 @@ elif is_inflation:
 elif is_deflation:
     regime_text = "❄️ [DEFLATION] 침체 국면. 국채 및 유동성 자산(QQQ) 헷지"
     regime_color = "info"
-    w_target['TLT'] = 0.5 if ('TLT' in def_mom and def_mom['TLT'] > 0) else 0.0
-    w_target['IEF'] = 0.5 if ('TLT' in def_mom and def_mom['TLT'] <= 0) else 0.0
+    w_target['TLT'] = 0.5 if def_mom.get('TLT', 0) > 0 else 0.0
+    w_target['IEF'] = 0.5 if def_mom.get('TLT', 0) <= 0 else 0.0
     w_target['QQQ'] = 0.5
 else:
     regime_text = "☀️ [GOLDILOCKS] 안정적 성장. 상위 공격 자산 집중"
     regime_color = "success"
-    if top_off in off_mom and off_mom[top_off] > 0:
+    if off_mom.get(top_off, 0) > 0:
         w_target[top_off], w_target['SPY'] = 0.8, 0.2
     else:
         w_target['SHY'] = 1.0 
 
 # ==========================================
-# 6. 화면 출력 (대시보드 UI)
+# 5. 대시보드 UI 출력
 # ==========================================
 st.subheader("1️⃣ 실시간 매크로 센서 (FRED & Market)")
 c1, c2, c3 = st.columns(3)
