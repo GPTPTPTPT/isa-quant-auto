@@ -14,15 +14,18 @@ st.title("🦅 V8 ISA 자산배분 오토파일럿")
 st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d')} | V8 Clinical Triage Engine")
 
 # ==========================================
-# 2. 데이터 직수입 함수 (에러 라이브러리 제거)
+# 2. 데이터 직수입 함수 (에러 방지 강화형)
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_fred_data():
-    # FRED에서 CSV를 직접 다운로드 (pandas_datareader 미사용)
+    # FRED CSV 파싱 에러('DATE' is not in list) 원천 차단
     def get_series(series_id):
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        df = pd.read_csv(url, index_col='DATE', parse_dates=True, na_values='.')
+        # header 이름에 의존하지 않고, 무조건 첫 번째 열(index_col=0)을 날짜로 강제 지정
+        df = pd.read_csv(url, index_col=0, parse_dates=True, na_values='.')
         df.columns = [series_id]
+        # 혹시 모를 에러 방지를 위해 인덱스 이름을 통일
+        df.index.name = 'DATE'
         return df
     
     hy = get_series('BAMLH0A0HYM2')
@@ -101,12 +104,12 @@ elif is_deflation:
     w_target['IEF'] = 0.5 if def_mom['TLT'] <= 0 else 0.0
     w_target['QQQ'] = 0.5
 else:
-    regime_text = "☀️ [GOLDILOCKS] 안정적 성장. 상위 공격 자산 몰빵"
+    regime_text = "☀️ [GOLDILOCKS] 안정적 성장. 상위 공격 자산 집중"
     regime_color = "success"
     if off_mom[top_off] > 0:
         w_target[top_off], w_target['SPY'] = 0.8, 0.2
     else:
-        w_target['SHY'] = 1.0 # 상승장이지만 가격이 부러진 기현상 방어
+        w_target['SHY'] = 1.0 
 
 # ==========================================
 # 5. 화면 출력 (대시보드 UI)
@@ -135,7 +138,7 @@ isa_mapping = {
     'SHY': 'KODEX 미국달러SOFR금리액티브'
 }
 
-st.write("매월 10일경, HTS/MTS를 켜고 기존 자산을 아래 비중에 맞게 리밸런싱 하십시오.")
+st.write("매월 10일경, HTS/MTS를 켜고 아래 비중에 맞게 리밸런싱 하십시오.")
 
 col_a, col_b = st.columns([1, 1])
 with col_a:
