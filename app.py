@@ -14,17 +14,14 @@ st.title("🦅 V8 ISA 자산배분 오토파일럿")
 st.caption(f"최종 업데이트: {datetime.now().strftime('%Y-%m-%d')} | V8 Clinical Triage Engine")
 
 # ==========================================
-# 2. 데이터 직수입 함수 (에러 방지 강화형)
+# 2. 데이터 직수입 함수 (데이터 증발 원천 차단)
 # ==========================================
 @st.cache_data(ttl=3600)
 def fetch_fred_data():
-    # FRED CSV 파싱 에러('DATE' is not in list) 원천 차단
     def get_series(series_id):
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-        # header 이름에 의존하지 않고, 무조건 첫 번째 열(index_col=0)을 날짜로 강제 지정
         df = pd.read_csv(url, index_col=0, parse_dates=True, na_values='.')
         df.columns = [series_id]
-        # 혹시 모를 에러 방지를 위해 인덱스 이름을 통일
         df.index.name = 'DATE'
         return df
     
@@ -36,12 +33,20 @@ def fetch_fred_data():
 @st.cache_data(ttl=3600)
 def fetch_price_data():
     tickers = ['SPY', 'QQQ', 'SOXX', 'GLD', 'TLT', 'IEF', 'SHY', 'DBC']
-    start_date = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
-    df = yf.download(tickers, start=start_date, progress=False)['Close']
-    df.dropna(inplace=True)
+    # 200일 이평선 및 252일 모멘텀 계산을 위해 넉넉하게 600일치 확보
+    start_date = (datetime.now() - timedelta(days=600)).strftime('%Y-%m-%d') 
+    df = yf.download(tickers, start=start_date, progress=False)
+    
+    # yfinance 버전 차이에 따른 열(Column) 구조 방어 로직
+    if isinstance(df.columns, pd.MultiIndex):
+        if 'Close' in df.columns.levels[0]:
+            df = df['Close']
+            
+    # [핵심 수정] 무식한 dropna() 제거 -> 전날 종가로 빈칸 채우기(ffill)
+    df = df.ffill().bfill()
     return df
 
-with st.spinner("미 연준(FRED) 및 글로벌 금융 데이터 직수입 중..."):
+with st.spinner("미 연준(FRED) 및 글로벌 금융 데이터 긁어오는 중..."):
     try:
         fred_df = fetch_fred_data()
         price_df = fetch_price_data()
@@ -49,33 +54,42 @@ with st.spinner("미 연준(FRED) 및 글로벌 금융 데이터 직수입 중..
         st.error(f"데이터 통신 에러: {e}")
         st.stop()
 
+# 2중 안전장치: 데이터가 비어있거나 너무 짧으면 중단
+if price_df.empty or len(price_df) < 252:
+    st.error("야후 파이낸스 데이터 로딩 실패. 1~2분 뒤 새로고침 해주세요.")
+    st.stop()
+
 # ==========================================
 # 3. 거시 지표 및 모멘텀 연산 (V8 로직)
 # ==========================================
-# [거시] 하이일드 스프레드 & 샴 룰
-hy_spread = fred_df['BAMLH0A0HYM2'].dropna().iloc[-1]
-unrate_monthly = fred_df['UNRATE'].dropna().resample('MS').first()
-sahm_rule = (unrate_monthly.rolling(3).mean() - unrate_monthly.rolling(12).min()).iloc[-1]
+try:
+    # [거시] 하이일드 스프레드 & 샴 룰
+    hy_spread = fred_df['BAMLH0A0HYM2'].dropna().iloc[-1]
+    unrate_monthly = fred_df['UNRATE'].dropna().resample('MS').first()
+    sahm_rule = (unrate_monthly.rolling(3).mean() - unrate_monthly.rolling(12).min()).iloc[-1]
 
-# [원자재] DBC Z-Score
-dbc_prices = price_df['DBC']
-dbc_ma200 = dbc_prices.rolling(200).mean().iloc[-1]
-dbc_std200 = dbc_prices.rolling(200).std().iloc[-1]
-dbc_z = (dbc_prices.iloc[-1] - dbc_ma200) / dbc_std200 if dbc_std200 > 0 else 0
+    # [원자재] DBC Z-Score
+    dbc_prices = price_df['DBC']
+    dbc_ma200 = dbc_prices.rolling(200).mean().iloc[-1]
+    dbc_std200 = dbc_prices.rolling(200).std().iloc[-1]
+    dbc_z = (dbc_prices.iloc[-1] - dbc_ma200) / dbc_std200 if dbc_std200 > 0 else 0
 
-# [모멘텀] 다중 기간 가중 점수 (1M, 3M, 6M, 12M)
-def calc_momentum(df, tk):
-    if len(df) < 252: return 0
-    p = df[tk]
-    m1 = (p.iloc[-1] / p.iloc[-21]) - 1
-    m3 = (p.iloc[-1] / p.iloc[-63]) - 1
-    m6 = (p.iloc[-1] / p.iloc[-126]) - 1
-    m12 = (p.iloc[-1] / p.iloc[-252]) - 1
-    return (m1 * 0.2) + (m3 * 0.3) + (m6 * 0.3) + (m12 * 0.2)
+    # [모멘텀] 다중 기간 가중 점수 (1M, 3M, 6M, 12M)
+    def calc_momentum(df, tk):
+        p = df[tk]
+        m1 = (p.iloc[-1] / p.iloc[-21]) - 1
+        m3 = (p.iloc[-1] / p.iloc[-63]) - 1
+        m6 = (p.iloc[-1] / p.iloc[-126]) - 1
+        m12 = (p.iloc[-1] / p.iloc[-252]) - 1
+        return (m1 * 0.2) + (m3 * 0.3) + (m6 * 0.3) + (m12 * 0.2)
 
-off_mom = {tk: calc_momentum(price_df, tk) for tk in ['QQQ', 'SOXX', 'SPY']}
-def_mom = {tk: calc_momentum(price_df, tk) for tk in ['GLD', 'TLT', 'IEF', 'SHY']}
-top_off = max(off_mom, key=off_mom.get)
+    off_mom = {tk: calc_momentum(price_df, tk) for tk in ['QQQ', 'SOXX', 'SPY']}
+    def_mom = {tk: calc_momentum(price_df, tk) for tk in ['GLD', 'TLT', 'IEF', 'SHY']}
+    top_off = max(off_mom, key=off_mom.get)
+    
+except Exception as e:
+    st.error(f"지표 연산 중 에러 발생 (데이터 꼬임): {e}")
+    st.stop()
 
 # ==========================================
 # 4. 트리아지(Triage) 체제 판별 및 비중 할당
