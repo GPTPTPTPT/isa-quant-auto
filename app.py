@@ -29,7 +29,6 @@ def fetch_fred_data():
         unrate = get_series('UNRATE')
         fred_df = hy.join(unrate, how='outer').ffill().last('400D')
     except:
-        # FRED 통신 실패 시 임시 복구용 하드코딩 (시스템 다운 방지)
         st.warning("⚠️ FRED 서버 지연으로 임시 매크로 지표를 대입합니다.")
         data = {'BAMLH0A0HYM2': [3.5], 'UNRATE': [4.0]}
         fred_df = pd.DataFrame(data, index=[datetime.now()])
@@ -75,7 +74,7 @@ if price_df.empty:
     st.error("⚠️ 글로벌 금융 데이터 서버(Yahoo/Stooq)가 모두 응답하지 않고 있습니다. 잠시 후 새로고침 해주세요.")
     st.stop()
 
-# 확보된 데이터 길이에 맞춰 계산 범위 유연하게 가변화 (오류 원천 차단)
+# 확보된 데이터 길이에 맞춰 계산 범위 유연하게 가변화
 available_len = len(price_df)
 m1_win = min(21, available_len - 1)
 m3_win = min(63, available_len - 1)
@@ -94,14 +93,15 @@ try:
     else:
         sahm_rule = 0.2
 
-    dbc_prices = price_df['DBC'] if 'DBC' in price_df.columns else price_df['SPY'] # DBC 부재시 SPY로 우회
+    dbc_prices = price_df['DBC'] if 'DBC' in price_df.columns else price_df['SPY'] 
     dbc_win = min(200, len(dbc_prices))
     dbc_ma200 = dbc_prices.rolling(dbc_win).mean().iloc[-1]
     dbc_std200 = dbc_prices.rolling(dbc_win).std().iloc[-1]
     dbc_z = (dbc_prices.iloc[-1] - dbc_ma200) / dbc_std200 if dbc_std200 > 0 else 0
 
     def calc_momentum(df, tk):
-        if tk syntax not in df.columns: return -999
+        # [오타 수정 완료] tk syntax not in 삭제 
+        if tk not in df.columns: return -999
         p = df[tk]
         m1 = (p.iloc[-1] / p.iloc[-m1_win]) - 1 if m1_win > 0 else 0
         m3 = (p.iloc[-1] / p.iloc[-m3_win]) - 1 if m3_win > 0 else 0
@@ -116,7 +116,7 @@ try:
     top_off = max(off_mom, key=off_mom.get) if off_mom else 'SPY'
     
 except Exception as e:
-    st.error(f"시스템 지표 정밀 파싱 오류 수동 우회 실행: {e}")
+    st.error(f"시스템 지표 파싱 오류 (자동 우회 실행): {e}")
     top_off = 'SPY'
     hy_spread, sahm_rule, dbc_z = 3.5, 0.2, 0.0
 
